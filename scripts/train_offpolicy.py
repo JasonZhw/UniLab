@@ -30,6 +30,30 @@ from unilab.training import (
 from unilab.training.experiment import ExperimentTracker
 
 
+def enable_faulthandler() -> None:
+    """Enable fatal-signal Python stack dumps unless explicitly disabled."""
+    if os.environ.get("UNILAB_FAULTHANDLER", "1").lower() in {"0", "false", "no", "off"}:
+        return
+    try:
+        import faulthandler
+
+        if not faulthandler.is_enabled():
+            faulthandler.enable(all_threads=True)
+    except Exception as exc:
+        print(f"[train_offpolicy] faulthandler unavailable: {exc}", file=sys.stderr)
+
+
+def build_failure_summary(exc: BaseException, run_summary: Any | None = None) -> dict[str, Any]:
+    summary = dict(run_summary) if isinstance(run_summary, dict) else {}
+    if summary.get("status") == "completed":
+        summary["status"] = "failed"
+    else:
+        summary.setdefault("status", "failed")
+    summary["error_type"] = type(exc).__name__
+    summary["error"] = str(exc)
+    return summary
+
+
 def default_device(torch_module, preferred: str | None = None) -> str:
     """Resolve runtime device with optional user override."""
     if preferred:
@@ -602,6 +626,7 @@ def play_offpolicy(algo_name: str, cfg: DictConfig) -> str | None:
 
 @hydra.main(version_base="1.3", config_path="../conf/offpolicy", config_name="config")
 def main(cfg: DictConfig) -> None:
+    enable_faulthandler()
     ensure_registries()
 
     seed_info = apply_configured_training_seed(cfg, torch_runtime=True, cuda=True)
@@ -636,18 +661,34 @@ def main(cfg: DictConfig) -> None:
 
     try:
         if not cfg.training.play_only:
-            runner = build_runner(algo_name, cfg)
+            runner = None
             try:
+                runner = build_runner(algo_name, cfg)
                 runner.learn(
                     max_iterations=cfg.algo.max_iterations,
                     save_interval=cfg.algo.save_interval,
                     log_dir=log_dir,
                     logger_type=cfg.training.logger,
                 )
+                run_summary = getattr(runner, "last_run_summary", None)
+                if isinstance(run_summary, dict) and run_summary.get("status") not in (
+                    None,
+                    "completed",
+                ):
+                    raise RuntimeError(
+                        f"Off-policy training ended with status={run_summary.get('status')!r}"
+                    )
                 if tracker is not None:
-                    tracker.update_summary(getattr(runner, "last_run_summary", None))
+                    tracker.update_summary(run_summary)
+            except BaseException as exc:
+                if tracker is not None:
+                    tracker.update_summary(
+                        build_failure_summary(exc, getattr(runner, "last_run_summary", None))
+                    )
+                raise
             finally:
-                runner.close()
+                if runner is not None:
+                    runner.close()
 
         if should_run_playback(
             play_only=cfg.training.play_only,
